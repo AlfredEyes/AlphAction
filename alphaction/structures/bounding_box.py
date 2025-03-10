@@ -1,5 +1,6 @@
 # Modified from https://github.com/facebookresearch/maskrcnn-benchmark/blob/master/maskrcnn_benchmark/structures/bounding_box.py
 import torch
+import numpy as np
 
 # transpose
 FLIP_LEFT_RIGHT = 0
@@ -16,9 +17,9 @@ class BoxList(object):
     labels.
     """
 
-    def __init__(self, bbox, image_size, mode="xyxy"):
+    def __init__(self, bbox, image_size, mode="xyxy", dtype=torch.float32):
         device = bbox.device if isinstance(bbox, torch.Tensor) else torch.device("cpu")
-        bbox = torch.as_tensor(bbox, dtype=torch.float32, device=device)
+        bbox = torch.as_tensor(bbox, dtype=dtype, device=device)
         if bbox.ndimension() != 2:
             raise ValueError(
                 "bbox should have 2 dimensions, got {}".format(bbox.ndimension())
@@ -35,6 +36,7 @@ class BoxList(object):
         self.size = image_size  # (image_width, image_height)
         self.mode = mode
         self.extra_fields = {}
+        self.score_plus_iou = True
 
     def add_field(self, field, field_data):
         self.extra_fields[field] = field_data
@@ -65,13 +67,13 @@ class BoxList(object):
         xmin, ymin, xmax, ymax = self._split_into_xyxy()
         if mode == "xyxy":
             bbox = torch.cat((xmin, ymin, xmax, ymax), dim=-1)
-            bbox = BoxList(bbox, self.size, mode=mode)
+            bbox = BoxList(bbox, self.size, mode=mode, dtype=self.bbox.dtype)
         else:
             TO_REMOVE = 1
             bbox = torch.cat(
                 (xmin, ymin, xmax - xmin + TO_REMOVE, ymax - ymin + TO_REMOVE), dim=-1
             )
-            bbox = BoxList(bbox, self.size, mode=mode)
+            bbox = BoxList(bbox, self.size, mode=mode, dtype=self.bbox.dtype)
         bbox._copy_extra_fields(self)
         return bbox
 
@@ -103,7 +105,7 @@ class BoxList(object):
         if ratios[0] == ratios[1]:
             ratio = ratios[0]
             scaled_box = self.bbox * ratio
-            bbox = BoxList(scaled_box, size, mode=self.mode)
+            bbox = BoxList(scaled_box, size, mode=self.mode, dtype=self.bbox.dtype)
             # bbox._copy_extra_fields(self)
             for k, v in self.extra_fields.items():
                 if not isinstance(v, torch.Tensor) and (hasattr(v, "resize")):
@@ -120,7 +122,7 @@ class BoxList(object):
         scaled_box = torch.cat(
             (scaled_xmin, scaled_ymin, scaled_xmax, scaled_ymax), dim=-1
         )
-        bbox = BoxList(scaled_box, size, mode="xyxy")
+        bbox = BoxList(scaled_box, size, mode="xyxy", dtype=self.bbox.dtype)
         # bbox._copy_extra_fields(self)
         for k, v in self.extra_fields.items():
             if not isinstance(v, torch.Tensor) and hasattr(v, "resize"):
@@ -159,7 +161,7 @@ class BoxList(object):
         transposed_boxes = torch.cat(
             (transposed_xmin, transposed_ymin, transposed_xmax, transposed_ymax), dim=-1
         )
-        bbox = BoxList(transposed_boxes, self.size, mode="xyxy")
+        bbox = BoxList(transposed_boxes, self.size, mode="xyxy", dtype=self.bbox.dtype)
         for k, v in self.extra_fields.items():
             if not isinstance(v, torch.Tensor) and (hasattr(v, 'transpose')):
                 v = v.transpose(method)
@@ -186,7 +188,7 @@ class BoxList(object):
         cropped_box = torch.cat(
             (cropped_xmin, cropped_ymin, cropped_xmax, cropped_ymax), dim=-1
         )
-        bbox = BoxList(cropped_box, (w, h), mode="xyxy")
+        bbox = BoxList(cropped_box, (w, h), mode="xyxy", dtype=self.bbox.dtype)
         # bbox._copy_extra_fields(self)
         for k, v in self.extra_fields.items():
             if not isinstance(v, torch.Tensor):
@@ -217,7 +219,7 @@ class BoxList(object):
         extended_box = torch.cat(
             (extended_xmin, extended_ymin, extended_xmax, extended_ymax), dim=-1
         )
-        bbox = BoxList(extended_box, self.size, mode='xyxy')
+        bbox = BoxList(extended_box, self.size, mode='xyxy', dtype=self.bbox.dtype)
         bbox.clip_to_image()
         for k, v in self.extra_fields.items():
             bbox.add_field(k, v)
@@ -247,7 +249,7 @@ class BoxList(object):
         aug_box = torch.cat(
             (jitter_xmin, jitter_ymin, jitter_xmax, jitter_ymax), dim=-1
         )
-        bbox = BoxList(aug_box, self.size, mode='xyxy')
+        bbox = BoxList(aug_box, self.size, mode='xyxy', dtype=self.bbox.dtype)
         bbox.clip_to_image(remove_empty=False)
         for k, v in self.extra_fields.items():
             bbox.add_field(k, v)
@@ -256,37 +258,89 @@ class BoxList(object):
     # Tensor-like methods
 
     def to(self, device):
-        bbox = BoxList(self.bbox.to(device), self.size, self.mode)
+        bbox = BoxList(self.bbox.to(device), self.size, self.mode, self.bbox.dtype)
         for k, v in self.extra_fields.items():
             if hasattr(v, "to"):
                 v = v.to(device)
             bbox.add_field(k, v)
         return bbox
 
-    def top_k(self, k):
-        # categories, bbox, scores
-        if "scores" in self.extra_fields:
+
+    #
+    def bbox_iou(self, bbox_a, bbox_b):
+        """Calculate Intersection-Over-Union(IOU) of two bounding boxes.
+        Parameters
+        ----------
+        bbox_a : numpy.ndarray
+            An ndarray with shape :math:`(N, 4)`.
+        bbox_b : numpy.ndarray
+            An ndarray with shape :math:`(M, 4)`.
+        offset : float or int, default is 0
+            The ``offset`` is used to control the whether the width(or height) is computed as
+            (right - left + ``offset``).
+            Note that the offset must be 0 for normalized bboxes, whose ranges are in ``[0, 1]``.
+        Returns
+        -------
+        numpy.ndarray
+            An ndarray with shape :math:`(N, M)` indicates IOU between each pairs of
+            bounding boxes in `bbox_a` and `bbox_b`.
+        """
+        offset = 0
+        bbox_a = bbox_a.bbox.numpy()
+        bbox_b = bbox_b.numpy()
+        if bbox_a.shape[1] < 4 or bbox_b.shape[1] < 4:
+            raise IndexError("Bounding boxes axis 1 must have at least length 4")
+
+        tl = np.maximum(bbox_a[:, None, :2], bbox_b[:, :2])
+        br = np.minimum(bbox_a[:, None, 2:4], bbox_b[:, 2:4])
+
+        area_i = np.prod(br - tl + offset, axis=2) * (tl < br).all(axis=2)
+        area_a = np.prod(bbox_a[:, 2:4] - bbox_a[:, :2] + offset, axis=1)
+        area_b = np.prod(bbox_b[:, 2:4] - bbox_b[:, :2] + offset, axis=1)
+        return area_i / (area_a[:, None] + area_b - area_i) 
+    # 
+
+    def top_k(self, k, boxes):
+        
+        iou = self.bbox_iou(boxes, self.bbox)
+        if "keypoints" in self.extra_fields:
+            return self
+        if "scores" in self.extra_fields and "keypoints" not in self.extra_fields:
             scores = self.extra_fields["scores"]
-            length = len(scores)
-            start = max(length - k, 0)
-            idx = torch.argsort(scores)[start:]
-            bbox = BoxList(self.bbox[[idx]], self.size, self.mode)
-            for k, v in self.extra_fields.items():
-                if isinstance(v, torch.Tensor):
-                    bbox.add_field(k, v[idx])
-                else:
-                    bbox.add_field(k, v)
-        else:
-            bbox = BoxList(self.bbox[:k], self.size, self.mode)
+            if self.score_plus_iou:
+                idx_score = torch.where(scores > 0.25)[0]
+                idx_iou = np.where(iou > 0)[1]
+                idx_iou = torch.tensor(idx_iou)
+                idx = torch.cat((idx_iou, idx_score), dim=0).unique()
+                # 
+                bbox = BoxList(self.bbox[[idx]], self.size, self.mode, self.bbox.dtype)
+                for k, v in self.extra_fields.items():
+                    if isinstance(v, torch.Tensor):
+                        bbox.add_field(k, v[idx])
+                    else:
+                        bbox.add_field(k, v)
+            else:
+                length = len(scores)
+                start = max(length - k, 0)
+                idx = torch.argsort(scores)[start:]
+                bbox = BoxList(self.bbox[[idx]], self.size, self.mode, self.bbox.dtype)
+                for k, v in self.extra_fields.items():
+                    if isinstance(v, torch.Tensor):
+                        bbox.add_field(k, v[idx])
+                    else:
+                        bbox.add_field(k, v)
+        elif "scores" not in self.extra_fields:
+            bbox = BoxList(self.bbox[:k], self.size, self.mode, self.bbox.dtype)
             for k, v in self.extra_fields.items():
                 if isinstance(v, torch.Tensor):
                     bbox.add_field(k, v[:k])
                 else:
                     bbox.add_field(k, v)
+        
         return bbox
-
+    
     def __getitem__(self, item):
-        bbox = BoxList(self.bbox[item], self.size, self.mode)
+        bbox = BoxList(self.bbox[item], self.size, self.mode, self.bbox.dtype)
         for k, v in self.extra_fields.items():
             if isinstance(v, torch.Tensor):
                 bbox.add_field(k, v[item])
@@ -322,7 +376,7 @@ class BoxList(object):
         return area
 
     def copy_with_fields(self, fields, skip_missing=False):
-        bbox = BoxList(self.bbox, self.size, self.mode)
+        bbox = BoxList(self.bbox, self.size, self.mode, self.bbox.dtype)
         if not isinstance(fields, (list, tuple)):
             fields = [fields]
         for field in fields:
